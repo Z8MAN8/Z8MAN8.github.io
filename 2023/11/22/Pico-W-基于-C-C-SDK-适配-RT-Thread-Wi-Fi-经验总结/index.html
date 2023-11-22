@@ -346,12 +346,12 @@
 <p>也可以参考我之前文章中介绍的使用 Clion 搭建开发调试下载环境，同样适用。这里需要注意的一点是，当你首次烧录使板载 LED 闪烁的程序时，开发板可能没有相应的现象，这可能不是你下载失败了，也不是你的开发板是坏的，而是 Pico W 的板载 LED 由无线模块控制，想要使其闪烁需要参照官方 Pico-Example 中 Pico W 的具体示例：<a target="_blank" rel="noopener" href="https://github.com/raspberrypi/pico-examples/tree/master/pico_w/wifi/blink">pico w&#x2F;wifi&#x2F;blink</a></p>
 <h2 id="准备工作"><a href="#准备工作" class="headerlink" title="准备工作"></a>准备工作</h2><p>开发环境搭建完成后，接下来就可以根据树莓派官方的 SDK 和 Example 调一调程序，逐渐梳理清楚逻辑和各模块之间的依赖关系。例如先运行一个最简单的 Wi-Fi scan 的示例程序，其主要逻辑是先 <code>cyw43_arch_init()</code> 初始化模块，再通过 <code>cyw43_arch_enable_sta_mode()</code> 使能为 STA 模式，最后使用<code>cyw43_wifi_scan()</code> 开始扫描并注册扫描完成回调函数打印扫描结果，整体的逻辑和 API 还是很简洁明了的。</p>
 <p>主要依赖于英飞凌提供的 cyw43-driver 驱动库，接下来我们开始通过分析 Cmake 文件确定各模块之间的调用关系和对一些宏定义的依赖关系。以下是一部分我通过 Cmake 文件大致整理的关系图:</p>
-<p><img src="/.com//2023-11-22%2017-00-32%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE.png" alt="依赖关系图"></p>
+<p>![依赖关系图](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-22 17-00-32 的屏幕截图.png)</p>
 <p>通过这样的关系图，我们能更直观快速的将官方的 SDK 和 Example 等 Cmake 工程移植为 RT-Thread 所使用的 Scons 工程。 </p>
 <h2 id="开始开发"><a href="#开始开发" class="headerlink" title="开始开发"></a>开始开发</h2><p>主要有以下三种类型：<code>poll</code> , <code>threadsafe_background</code>,  <code>freertos</code> 。poll 是需要用户定期调用的，并且不保证线程安全性；threadsafe_background 和 freertos 能够保证线程安全性，threadsafe_background 不使用 RTOS，通过<strong>低优先级的 ISR</strong> 实现调度同步，freertos 是通过专门的<strong>线程</strong>处理调动同步。</p>
 <p>一开始我选择的是基于 <code>threadsafe_background</code> 进行开发，通过参照以上 Cmake 关系图很快就成功在 RT-Thread 的 Bsp 中复现了 Wi-Fi scan 示例程序。但是开发后续需要使用 lwip 的功能时，与 RT-Thread 就产生了很多冲突。</p>
 <p>想要更好的适配 RT-Thread 还是得按照 RTOS 的来，于是开始复现官方提供的基于 FreeRTOS 的，首先想到的是使用 RT-Thread 的 FreeRTOS 兼容层软件包，在 menuconfig 中使能即可：</p>
-<p><img src="/.com//2023-11-22%2017-24-49%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE.png" alt="menuconfig配置"></p>
+<p>![menuconfig配置](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-22 17-24-49 的屏幕截图.png)</p>
 <p>引入兼容层后大部分报错消失了，但报错没有 <code>portCHECK_IF_IN_ISR</code>  的相关实现，在 FreeRTOS 的源码中查找发现其为 RP2040 特有的实现。其是用于判断上下文环境是否处于中断中，改为 RT-Thread 中的检测中断 nest 是否大于 0 即可。</p>
 <p>成功编译下载程序后，却因为定时器进入了 <code>hardfault</code> ，检查发现 FreeRTOS 兼容层中的 portMAX_DEALY 对接错了，不是 RT_TICK_MAX ，应该为 RT_TICK_MAX &#x2F; 2 - 1（韦东山老师在rtt开发者大会上专门讲解过 RTT 优雅的定时器算法，感兴趣可以看看）这个问题目前已经修复了。</p>
 <p>之后程序还是进入  <code>hardfault</code> ，一直 debug 对比代码没有发现问题，再次分析对比 FreeRTOS 和 RT-Thread 之间的差异，两者的优先级等级和数值的关系是相反的，检查发现 <code>async_context_task</code> 线程的优先级为 <code>tskIDLE_PRIORITY + 4</code> 在 FreeRTOS 中优先级比空闲线程高4，但在 RT-Thread 中因为优先级太低，得不到调度，造成死锁问题。解决办法是将其线程优先级提高。</p>
@@ -390,13 +390,13 @@
 <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line">// 重复初始化信号量无法获取造成阻塞</span><br><span class="line">bool lwip_rtthread_init(async_context_t *context) &#123;</span><br><span class="line">    RT_ASSERT(!lwip_context);</span><br><span class="line">    lwip_context = context;</span><br><span class="line">    static bool done_lwip_init;</span><br><span class="line">    if (!done_lwip_init) &#123;</span><br><span class="line">        done_lwip_init = true;</span><br><span class="line">        rt_sem_t init_sem = rt_sem_create(&quot;lwip_init_sem&quot;, 0, RT_IPC_FLAG_PRIO);</span><br><span class="line">        tcpip_task_blocker = rt_sem_create(&quot;tcpip_task_blocker&quot;, 0, RT_IPC_FLAG_PRIO);</span><br><span class="line">        tcpip_init(tcpip_init_done, init_sem);</span><br><span class="line">        // 阻塞在信号量获取</span><br><span class="line">        rt_sem_take(init_sem, RT_TICK_MAX / 2 - 1);</span><br><span class="line">        rt_sem_delete(init_sem);</span><br><span class="line">    &#125; else &#123;</span><br><span class="line">        rt_sem_release(tcpip_task_blocker);</span><br><span class="line">    &#125;</span><br><span class="line">    return true;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
 
 <p>运行过程中可能会报错提示 lwip 线程栈空间不足，在 menuconfig 中适当改大即可</p>
-<p><img src="/.com//2023-11-22%2018-25-59%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE-1700662852705-1.png" alt="调整lwip栈大小"></p>
+<p>![调整lwip栈大小](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-22 18-25-59 的屏幕截图.png)</p>
 <p>对接完成后测试功能，使能为 STA 模式，日志中显示 mac 地址</p>
-<p><img src="/.com//2023-11-22%2018-28-55%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE.png" alt="mac地址"></p>
+<p>![mac地址](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-22 18-28-55 的屏幕截图.png)</p>
 <p>扫描附近ap</p>
-<p><img src="/.com//2023-11-22%2018-30-31%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE.png" alt="wifi scan"></p>
+<p>![wifi scan](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-22 18-30-31 的屏幕截图.png)</p>
 <p>连接ap并成功ping通</p>
-<p><img src="/.com//2023-11-20%2015-00-27%20%E7%9A%84%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE.png" alt="ping通"></p>
+<p>![ping通](Pico-W-基于-C-C-SDK-适配-RT-Thread-Wi-Fi-经验总结&#x2F;2023-11-20 15-00-27 的屏幕截图.png)</p>
 <p>测试ap功能，使能为AP模式，设置名称及pwd，可以使用手机成功连接。</p>
 <h2 id="注意事项"><a href="#注意事项" class="headerlink" title="注意事项"></a>注意事项</h2><ul>
 <li><p>使用pico w的无线模块需要使用一些相关的宏定义，如无线模块的引脚定义等，其定义在 picow.h 中。但程序默认包含的是 pico.h 。可以通过定义宏 <code>PICO_CONFIG_HEADER=boards/pico_w.h</code> 进行切换。</p>
